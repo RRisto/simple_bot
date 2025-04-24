@@ -1,0 +1,4 @@
+backend/.env
+weaviate_storage
+__pycache__/
+*.pyc

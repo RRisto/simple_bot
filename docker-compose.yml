@@ -1,0 +1,32 @@
+version: "3.8"
+
+services:
+  weaviate:
+    image: semitechnologies/weaviate:latest
+    ports:
+      - "8080:8080"
+    environment:
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      PERSISTENCE_DATA_PATH: "/var/lib/weaviate"
+    volumes:
+      - ./weaviate_storage:/var/lib/weaviate  # ✅ host folder mapping
+
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env
+    volumes:
+      - ./rag_docs:/app/rag_docs  # ✅ mount host rag_docs into container
+    depends_on:
+      - weaviate
+
+  loader:
+    build: ./loader
+    env_file:
+      - ./backend/.env
+    volumes:
+      - ./rag_docs:/app/rag_docs
+    depends_on:
+      - weaviate

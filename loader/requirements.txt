@@ -1,0 +1,6 @@
+langchain
+langchain-community
+langchain-openai
+weaviate-client>=4.0.0,<5.0.0
+langchain-weaviate
+python-dotenv

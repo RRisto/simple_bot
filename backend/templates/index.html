@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>RAG Chatbot</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #f9fafb;
+      padding: 20px;
+      max-width: 600px;
+      margin: auto;
+    }
+    #chat {
+      border: 1px solid #ddd;
+      background: white;
+      padding: 10px;
+      height: 400px;
+      overflow-y: auto;
+      margin-bottom: 10px;
+    }
+    .user {
+      text-align: right;
+      color: #2563eb;
+    }
+    .bot {
+      text-align: left;
+      color: #111827;
+    }
+    input {
+      padding: 10px;
+      width: 80%;
+      border: 1px solid #ccc;
+      border-radius: 5px;
+    }
+    button {
+      padding: 10px 20px;
+      background: #2563eb;
+      color: white;
+      border: none;
+      border-radius: 5px;
+      margin-left: 10px;
+    }
+  </style>
+</head>
+<body>
+  <h2>💬 Ask the Chatbot</h2>
+  <div id="chat"></div>
+  <input id="message" placeholder="Type your question..." />
+  <button onclick="send()">Send</button>
+
+  <script>
+    const userId = "user-" + Math.random().toString(36).slice(2);
+
+    async function send() {
+      const input = document.getElementById("message");
+      const message = input.value;
+      if (!message.trim()) return;
+      input.value = "";
+
+      const chat = document.getElementById("chat");
+      chat.innerHTML += `<div class="user"><strong>You:</strong> ${message}</div>`;
+
+      try {
+        const res = await fetch("/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ user_id: userId, message })
+        });
+
+        const data = await res.json();
+        chat.innerHTML += `<div class="bot"><strong>Bot:</strong> ${data.response}</div>`;
+        chat.scrollTop = chat.scrollHeight;
+      } catch (err) {
+        chat.innerHTML += `<div class="bot text-red-500"><strong>Bot:</strong> ❌ Error contacting server</div>`;
+      }
+    }
+
+    // ✅ Send message when Enter key is pressed in input
+    document.getElementById("message").addEventListener("keydown", function (e) {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        send();
+      }
+    });
+  </script>
+</body>
+</html>

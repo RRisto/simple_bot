@@ -1,0 +1,11 @@
+fastapi[all]
+langchain
+langchain-community
+langchain-openai
+langchain-weaviate
+openai
+fastapi
+uvicorn
+python-dotenv
+python-multipart
+tiktoken
