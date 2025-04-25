@@ -3,3 +3,4 @@ weaviate_storage
 __pycache__/
 *.pyc
 .idea
+logs

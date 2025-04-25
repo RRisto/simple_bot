@@ -19,6 +19,7 @@ services:
       - ./backend/.env
     volumes:
       - ./rag_docs:/app/rag_docs  # ✅ mount host rag_docs into container
+      - ./logs:/app/logs  # Mount local ./logs to container /app/logs
     depends_on:
       - weaviate
 

@@ -1,6 +1,7 @@
 import os
 import time
 import requests
+import logging
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -8,7 +9,7 @@ from dotenv import load_dotenv
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_core.tools import tool
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import ToolMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_community.chat_message_histories import ChatMessageHistory
@@ -26,6 +27,21 @@ WEAVIATE_HOST = os.getenv("WEAVIATE_HOST")
 WEAVIATE_PORT = os.getenv("WEAVIATE_PORT")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+# === Setup logging  ===
+
+os.makedirs("logs", exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("logs/chatbot.log"),
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger(__name__)
+
+
 # === Wait for Weaviate ===
 def wait_for_weaviate(url, timeout=10):
     print(f"⏳ Waiting for Weaviate at {url}...")
@@ -38,6 +54,7 @@ def wait_for_weaviate(url, timeout=10):
             pass
         time.sleep(1)
     raise Exception("Weaviate did not start in time")
+
 
 wait_for_weaviate(f"http://{WEAVIATE_HOST}:{WEAVIATE_PORT}")
 
@@ -81,19 +98,31 @@ vectorstore.add_documents([test_doc])
 results = retriever.invoke("advokatuur")
 print("🔍 Manual Weaviate test result:", results)
 
+
 # === Tool definition ===
 @tool
 def search_docs(query: str) -> str:
     """Search documentation for relevant content."""
     print(f"🔍 search_docs called with query: {query}")
     docs = retriever.invoke(query)
-    result = "\n\n".join([doc.page_content for doc in docs[:3]])
+    #deduplicate docs
+    seen = set()
+    unique_docs = []
+    for doc in docs:
+        content = doc.page_content.strip()
+        if content not in seen:
+            seen.add(content)
+            unique_docs.append(content)
+    result = "\n\n".join(unique_docs[:3])
+    # result = "\n\n".join([doc.page_content for doc in unique_docs[:3]])
     print(f"📚 search_docs result:\n{result}")
     return result
 
+
 # === Prompt with memory placeholder ===
 prompt = ChatPromptTemplate.from_messages([
-    ("system", "You are a helpful assistant. Use search_docs to answer questions. If answer is not in documents, return that. Remember user's name if mentioned. Use chat history to answer contextually."),
+    ("system",
+     "You are a helpful assistant. Use search_docs to answer questions. If answer is not in documents, return that. Remember user's name if mentioned. Use chat history to answer contextually."),
     MessagesPlaceholder(variable_name="history"),
     ("human", "{input}")
 ])
@@ -104,8 +133,10 @@ llm = ChatOpenAI(model="gpt-4", temperature=0).bind_tools([search_docs])
 # === Store session memory ===
 store = {}
 
+
 def get_memory(session_id):
     return store.setdefault(session_id, ChatMessageHistory())
+
 
 # === Chain with memory ===
 chat_chain = RunnableWithMessageHistory(
@@ -115,46 +146,56 @@ chat_chain = RunnableWithMessageHistory(
     history_messages_key="history"
 )
 
+
 # === FastAPI schema ===
 class ChatRequest(BaseModel):
     user_id: str
     message: str
+
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
     session_id = req.user_id
     user_input = req.message
 
-    # First round: get assistant response
-    response = await chat_chain.ainvoke(
-        {"input": user_input},
-        config={"configurable": {"session_id": session_id}},
-    )
+    logger.info(f"[{session_id}] 📨 User input: {user_input}")
 
-    # If tool call exists, resolve it and call again
-    if response.tool_calls:
-        tool_messages = []
-
-        for tool_call in response.tool_calls:
-            tool_name = tool_call["name"]
-            tool_args = tool_call["args"]
-            tool_id = tool_call["id"]
-
-            if tool_name == "search_docs":
-                tool_result = search_docs.invoke(tool_args)
-
-                # Append tool response to memory directly
-                memory = get_memory(session_id)
-                memory.add_message(ToolMessage(tool_call_id=tool_id, content=tool_result))
-
-        # Re-run chain with the tool response now in memory
-        final_response = await chat_chain.ainvoke(
+    try:
+        response = await chat_chain.ainvoke(
             {"input": user_input},
             config={"configurable": {"session_id": session_id}},
         )
-        return {"response": final_response.content}
 
-    return {"response": response.content}
+        logger.info(f"[{session_id}] 🤖 First response: {response.content}")
+        if response.tool_calls:
+            logger.info(f"[{session_id}] 🛠 Tool calls: {response.tool_calls}")
+
+            for tool_call in response.tool_calls:
+                tool_name = tool_call["name"]
+                tool_args = tool_call["args"]
+                tool_id = tool_call["id"]
+
+                if tool_name == "search_docs":
+                    tool_result = search_docs.invoke(tool_args)
+                    logger.info(f"[{session_id}] 📚 Tool result: {tool_result}")
+
+                    memory = get_memory(session_id)
+                    memory.add_message(ToolMessage(tool_call_id=tool_id, content=tool_result))
+
+            final_response = await chat_chain.ainvoke(
+                {"input": user_input},
+                config={"configurable": {"session_id": session_id}},
+            )
+
+            logger.info(f"[{session_id}] 🤖 Final response: {final_response.content}")
+            return {"response": final_response.content}
+
+        return {"response": response.content}
+
+    except Exception as e:
+        logger.exception(f"[{session_id}] ❌ Error: {str(e)}")
+        return {"response": "Something went wrong."}
+
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
