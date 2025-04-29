@@ -124,8 +124,7 @@ print("🔍 Manual Weaviate test result:", results)
 
 # === Tool definition ===
 @tool
-@observe(name="search_docs_tool")
-def search_docs(query: str) -> str:
+def search_docs(query: str):
     """Search documentation for relevant content."""
     print(f"🔍 search_docs called with query: {query}")
     docs = retriever.invoke(query)
@@ -165,33 +164,18 @@ chat_chain = RunnableWithMessageHistory(
 
 # === Observed Chat Chain Call ===
 @observe(name="chat_chain_invoke")
-async def invoke_chat_chain(user_input: str, session_id: str, trace=None):
-    try:
-        response = await chat_chain.ainvoke(
-            {"input": user_input},
-            config={"configurable": {"session_id": session_id}},
-        )
-
-        # # Optional manual logging inside this observation
-        # if trace:
-        #     trace.generation(
-        #         name="model_response",
-        #         input=user_input,
-        #         output=response.content
-        #     )
-        #     trace.score(name="chain_success", value=1)
-
-        return response
-
-    except Exception as e:
-        if trace:
-            trace.score(name="chain_success", value=0)
-            trace.generation(
-                name="error",
-                input=user_input,
-                output=str(e)
-            )
-        raise e
+async def invoke_chat_chain(user_input: str, session_id: str, trace_id: str):
+    # manually pass trace_id
+    response = await chat_chain.ainvoke(
+        {"input": user_input},
+        config={
+            "configurable": {
+                "session_id": session_id,
+                "langfuse": {"trace_id": trace_id}
+            }
+        },
+    )
+    return response
 # === FastAPI schema ===
 class ChatRequest(BaseModel):
     user_id: str
@@ -206,11 +190,13 @@ async def chat(req: ChatRequest):
     logger.info(f"[{session_id}] 📨 User input: {user_input}")
 
     # 🔥 Start Langfuse trace
-    # trace = langfuse.trace(
-    #     name="chat_session",
-    #     user_id=session_id,
-    #     metadata={"user_message": user_input},
-    # )
+
+    # manually start trace
+    trace = langfuse.trace(
+        name="chat_session",
+        user_id=session_id,
+        metadata={"user_message": user_input},
+    )
     # user_input_gen = trace.generation(
     #     name="user_message",
     #     input=user_input,
@@ -219,7 +205,11 @@ async def chat(req: ChatRequest):
 
     try:
         # First model call
-        response = await invoke_chat_chain(user_input=user_input, session_id=session_id)
+        response = await invoke_chat_chain(
+            user_input=user_input,
+            session_id=session_id,
+            trace_id=trace.id,  # <<< important!
+        )
         logger.info(f"[{session_id}] 🤖 First response: {response.content}")
         # user_input_gen.end(output=response.content)
 
@@ -253,7 +243,7 @@ async def chat(req: ChatRequest):
 
             # Second model call after tool
             # final_response = await invoke_chat_chain(user_input=user_input, session_id=session_id, trace=trace)
-            final_response = await invoke_chat_chain(user_input="", session_id=session_id)
+            final_response = await invoke_chat_chain(user_input="", session_id=session_id, trace_id=trace.id)
             logger.info(f"[{session_id}] 🤖 Final response: {final_response.content}")
 
             # user_input_gen.end(output=final_response.content)
