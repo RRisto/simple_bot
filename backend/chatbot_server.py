@@ -14,6 +14,8 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_weaviate.vectorstores import WeaviateVectorStore
+from langfuse import Langfuse
+from langfuse.decorators import observe
 from weaviate.client import WeaviateClient
 from weaviate.connect import ConnectionParams
 
@@ -28,7 +30,6 @@ WEAVIATE_PORT = os.getenv("WEAVIATE_PORT")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # === Setup logging  ===
-
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -38,12 +39,36 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-
 logger = logging.getLogger(__name__)
 
+# === Langfuse setup ===
+langfuse = Langfuse(
+    public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
+    secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
+    host=os.getenv("LANGFUSE_HOST"),
+    debug=True,
+)
+
+from langfuse import Langfuse
+
+langfuse = Langfuse(
+  secret_key="sk-lf-edcc7119-bc4a-4c76-9f8c-515bf7e8c238",
+  public_key="pk-lf-567548a7-51ee-4bfd-a488-cfdfdb00ce8f",
+  host="http://localhost:3000",
+  debug=True,
+)
+
+try:
+    response = requests.get(f"{os.getenv('LANGFUSE_HOST')}/api/public/health")
+    if response.status_code == 200:
+        print("✅ Langfuse server is healthy:", response.json())
+    else:
+        print(f"⚠️ Langfuse health endpoint returned status: {response.status_code}")
+except Exception as e:
+    print(f"❌ Failed to reach Langfuse server: {e}")
 
 # === Wait for Weaviate ===
-def wait_for_weaviate(url, timeout=10):
+def wait_for_weaviate(url, timeout=30):
     print(f"⏳ Waiting for Weaviate at {url}...")
     for _ in range(timeout):
         try:
@@ -54,7 +79,6 @@ def wait_for_weaviate(url, timeout=10):
             pass
         time.sleep(1)
     raise Exception("Weaviate did not start in time")
-
 
 wait_for_weaviate(f"http://{WEAVIATE_HOST}:{WEAVIATE_PORT}")
 
@@ -76,7 +100,7 @@ client.connect()
 print("🧪 Verifying index structure:")
 print(client.collections.list_all())
 print("🧪 Sample object:")
-print(client.collections.get("LangChain").query.fetch_objects(limit=1))
+print(client.collections.get("LangchainDocs").query.fetch_objects(limit=1))
 
 embedding = OpenAIEmbeddings()
 vectorstore = WeaviateVectorStore(
@@ -87,6 +111,7 @@ vectorstore = WeaviateVectorStore(
 )
 
 retriever = vectorstore.as_retriever()
+
 print("Testing Weaviate query:")
 print(retriever.invoke("advokatuur"))
 
@@ -94,10 +119,8 @@ print(retriever.invoke("advokatuur"))
 test_doc = Document(page_content="Advokatuur on Eesti õigussüsteemi osa.")
 vectorstore.add_documents([test_doc])
 
-# Re-query after inserting
 results = retriever.invoke("advokatuur")
 print("🔍 Manual Weaviate test result:", results)
-
 
 # === Tool definition ===
 @tool
@@ -105,7 +128,6 @@ def search_docs(query: str) -> str:
     """Search documentation for relevant content."""
     print(f"🔍 search_docs called with query: {query}")
     docs = retriever.invoke(query)
-    #deduplicate docs
     seen = set()
     unique_docs = []
     for doc in docs:
@@ -114,12 +136,10 @@ def search_docs(query: str) -> str:
             seen.add(content)
             unique_docs.append(content)
     result = "\n\n".join(unique_docs[:3])
-    # result = "\n\n".join([doc.page_content for doc in unique_docs[:3]])
     print(f"📚 search_docs result:\n{result}")
     return result
 
-
-# === Prompt with memory placeholder ===
+# === Prompt with memory ===
 prompt = ChatPromptTemplate.from_messages([
     ("system",
      "You are a helpful assistant. Use search_docs to answer questions. If answer is not in documents, return that. Remember user's name if mentioned. Use chat history to answer contextually."),
@@ -130,15 +150,11 @@ prompt = ChatPromptTemplate.from_messages([
 # === Bind tools to model ===
 llm = ChatOpenAI(model="gpt-4", temperature=0).bind_tools([search_docs])
 
-# === Store session memory ===
 store = {}
-
 
 def get_memory(session_id):
     return store.setdefault(session_id, ChatMessageHistory())
 
-
-# === Chain with memory ===
 chat_chain = RunnableWithMessageHistory(
     prompt | llm,
     get_session_history=get_memory,
@@ -146,19 +162,18 @@ chat_chain = RunnableWithMessageHistory(
     history_messages_key="history"
 )
 
-
-# === FastAPI schema ===
-class ChatRequest(BaseModel):
-    user_id: str
-    message: str
-
-
-@app.post("/chat")
-async def chat(req: ChatRequest):
-    session_id = req.user_id
-    user_input = req.message
-
-    logger.info(f"[{session_id}] 📨 User input: {user_input}")
+# === Observed Chat Chain Call ===
+@observe(name="chat_chain_invoke")
+async def invoke_chat_chain(user_input: str, session_id: str):
+    # 🔥 Start a manual Langfuse trace for this invocation
+    trace = langfuse.trace(
+        name="chat_chain_step",
+        user_id=session_id,
+        metadata={
+            "user_input": user_input,
+            "session_id": session_id,
+        },
+    )
 
     try:
         response = await chat_chain.ainvoke(
@@ -166,9 +181,57 @@ async def chat(req: ChatRequest):
             config={"configurable": {"session_id": session_id}},
         )
 
+        # 🔥 Optionally log the model response as metadata
+        trace.generation(
+            name="model_response",
+            input=user_input,
+            output=response.content,
+        )
+
+        trace.score(name="chain_success", value=1)
+
+        return response
+
+    except Exception as e:
+        trace.score(name="chain_success", value=0)
+        trace.generation(
+            name="error",
+            input=user_input,
+            output=str(e),
+        )
+        raise e
+
+# === FastAPI schema ===
+class ChatRequest(BaseModel):
+    user_id: str
+    message: str
+
+# === Chat Endpoint ===
+@app.post("/chat")
+async def chat(req: ChatRequest):
+    session_id = req.user_id
+    user_input = req.message
+
+    logger.info(f"[{session_id}] 📨 User input: {user_input}")
+
+    trace = langfuse.trace(
+        name="chat_session",
+        user_id=session_id,
+        metadata={"user_message": user_input},
+    )
+
+    user_input_gen = trace.generation(
+        name="user_message",
+        input=user_input,
+        output="(processing)",
+    )
+
+    try:
+        response = await invoke_chat_chain(user_input=user_input, session_id=session_id)
         logger.info(f"[{session_id}] 🤖 First response: {response.content}")
+
         if response.tool_calls:
-            logger.info(f"[{session_id}] 🛠 Tool calls: {response.tool_calls}")
+            logger.info(f"[{session_id}] 🛠 Tool calls detected")
 
             for tool_call in response.tool_calls:
                 tool_name = tool_call["name"]
@@ -176,28 +239,47 @@ async def chat(req: ChatRequest):
                 tool_id = tool_call["id"]
 
                 if tool_name == "search_docs":
+                    tool_span = trace.span(
+                        name="search_docs_tool",
+                        input=tool_args,
+                        metadata={"tool_call_id": tool_id},
+                    )
                     tool_result = search_docs.invoke(tool_args)
-                    logger.info(f"[{session_id}] 📚 Tool result: {tool_result}")
+                    tool_span.end(output=tool_result)
 
                     memory = get_memory(session_id)
                     memory.add_message(ToolMessage(tool_call_id=tool_id, content=tool_result))
 
-            final_response = await chat_chain.ainvoke(
-                {"input": user_input},
-                config={"configurable": {"session_id": session_id}},
-            )
-
+            # After all tool results injected, CONTINUE the chat (no input needed!)
+            final_response = await invoke_chat_chain(user_input="", session_id=session_id)
             logger.info(f"[{session_id}] 🤖 Final response: {final_response.content}")
+
+            user_input_gen.end(output=final_response.content)
+            trace.score(name="conversation_success", value=1)
+
             return {"response": final_response.content}
 
-        return {"response": response.content}
+        else:
+            # No tools needed
+            user_input_gen.end(output=response.content)
+            trace.score(name="conversation_success", value=1)
+
+            return {"response": response.content}
 
     except Exception as e:
         logger.exception(f"[{session_id}] ❌ Error: {str(e)}")
-        return {"response": "Something went wrong."}
 
+        user_input_gen.end(output="Error")
+        trace.score(name="conversation_success", value=0)
+
+        return {"response": "Something went wrong."}
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
     with open("templates/index.html", "r", encoding="utf-8") as f:
         return f.read()
+
+@app.on_event("shutdown")
+def shutdown_event():
+    client.close()
+    print("✅ Weaviate client closed on shutdown")

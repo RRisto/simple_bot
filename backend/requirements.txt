@@ -1,11 +1,14 @@
 fastapi[all]
+uvicorn[standard]
+
 langchain
 langchain-community
 langchain-openai
 langchain-weaviate
 openai
-fastapi
-uvicorn
+
 python-dotenv
 python-multipart
 tiktoken
+
+langfuse[langchain]
