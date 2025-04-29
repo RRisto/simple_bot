@@ -50,7 +50,7 @@ langfuse = Langfuse(
 )
 
 from langfuse import Langfuse
-
+#TODO
 langfuse = Langfuse(
   secret_key="sk-lf-edcc7119-bc4a-4c76-9f8c-515bf7e8c238",
   public_key="pk-lf-567548a7-51ee-4bfd-a488-cfdfdb00ce8f",
@@ -164,43 +164,33 @@ chat_chain = RunnableWithMessageHistory(
 
 # === Observed Chat Chain Call ===
 @observe(name="chat_chain_invoke")
-async def invoke_chat_chain(user_input: str, session_id: str):
-    # 🔥 Start a manual Langfuse trace for this invocation
-    trace = langfuse.trace(
-        name="chat_chain_step",
-        user_id=session_id,
-        metadata={
-            "user_input": user_input,
-            "session_id": session_id,
-        },
-    )
-
+async def invoke_chat_chain(user_input: str, session_id: str, trace=None):
     try:
         response = await chat_chain.ainvoke(
             {"input": user_input},
             config={"configurable": {"session_id": session_id}},
         )
 
-        # 🔥 Optionally log the model response as metadata
-        trace.generation(
-            name="model_response",
-            input=user_input,
-            output=response.content,
-        )
-
-        trace.score(name="chain_success", value=1)
+        # Optional manual logging inside this observation
+        if trace:
+            trace.generation(
+                name="model_response",
+                input=user_input,
+                output=response.content
+            )
+            trace.score(name="chain_success", value=1)
 
         return response
 
     except Exception as e:
-        trace.score(name="chain_success", value=0)
-        trace.generation(
-            name="error",
-            input=user_input,
-            output=str(e),
-        )
+        if trace:
+            trace.score(name="chain_success", value=0)
+            trace.generation(
+                name="error",
+                input=user_input,
+                output=str(e)
+            )
         raise e
-
 # === FastAPI schema ===
 class ChatRequest(BaseModel):
     user_id: str
@@ -214,6 +204,7 @@ async def chat(req: ChatRequest):
 
     logger.info(f"[{session_id}] 📨 User input: {user_input}")
 
+    # ✅ Start Langfuse trace
     trace = langfuse.trace(
         name="chat_session",
         user_id=session_id,
@@ -227,11 +218,24 @@ async def chat(req: ChatRequest):
     )
 
     try:
-        response = await invoke_chat_chain(user_input=user_input, session_id=session_id)
+        # ✅ First LLM call
+        response = await chat_chain.ainvoke(
+            {"input": user_input},
+            config={
+                "configurable": {
+                    "session_id": session_id,
+                    "langfuse": {
+                        "user_id": session_id,
+                        "traceId": trace.id,  # ✅ CORRECT KEY
+                    }
+                }
+            },
+        )
+
         logger.info(f"[{session_id}] 🤖 First response: {response.content}")
 
         if response.tool_calls:
-            logger.info(f"[{session_id}] 🛠 Tool calls detected")
+            logger.info(f"[{session_id}] 🛠 Tool calls: {response.tool_calls}")
 
             for tool_call in response.tool_calls:
                 tool_name = tool_call["name"]
@@ -250,29 +254,39 @@ async def chat(req: ChatRequest):
                     memory = get_memory(session_id)
                     memory.add_message(ToolMessage(tool_call_id=tool_id, content=tool_result))
 
-            # After all tool results injected, CONTINUE the chat (no input needed!)
-            final_response = await invoke_chat_chain(user_input="", session_id=session_id)
-            logger.info(f"[{session_id}] 🤖 Final response: {final_response.content}")
+            # ✅ Second LLM call (with tool results)
+            final_response = await chat_chain.ainvoke(
+                {"input": user_input},
+                config={
+                    "configurable": {
+                        "session_id": session_id,
+                        "langfuse": {
+                            "user_id": session_id,
+                            "traceId": trace.id,  # ✅ CORRECT KEY
+                        }
+                    }
+                },
+            )
 
+            logger.info(f"[{session_id}] 🤖 Final response: {final_response.content}")
             user_input_gen.end(output=final_response.content)
             trace.score(name="conversation_success", value=1)
 
             return {"response": final_response.content}
 
-        else:
-            # No tools needed
-            user_input_gen.end(output=response.content)
-            trace.score(name="conversation_success", value=1)
-
-            return {"response": response.content}
+        # No tool usage path
+        user_input_gen.end(output=response.content)
+        trace.score(name="conversation_success", value=1)
+        return {"response": response.content}
 
     except Exception as e:
         logger.exception(f"[{session_id}] ❌ Error: {str(e)}")
-
         user_input_gen.end(output="Error")
         trace.score(name="conversation_success", value=0)
-
         return {"response": "Something went wrong."}
+
+
+
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
