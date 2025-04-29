@@ -204,13 +204,12 @@ async def chat(req: ChatRequest):
 
     logger.info(f"[{session_id}] 📨 User input: {user_input}")
 
-    # ✅ Start Langfuse trace
+    # 🔥 Start Langfuse trace
     trace = langfuse.trace(
         name="chat_session",
         user_id=session_id,
         metadata={"user_message": user_input},
     )
-
     user_input_gen = trace.generation(
         name="user_message",
         input=user_input,
@@ -218,20 +217,8 @@ async def chat(req: ChatRequest):
     )
 
     try:
-        # ✅ First LLM call
-        response = await chat_chain.ainvoke(
-            {"input": user_input},
-            config={
-                "configurable": {
-                    "session_id": session_id,
-                    "langfuse": {
-                        "user_id": session_id,
-                        "traceId": trace.id,  # ✅ CORRECT KEY
-                    }
-                }
-            },
-        )
-
+        # First model call
+        response = await invoke_chat_chain(user_input=user_input, session_id=session_id, trace=trace)
         logger.info(f"[{session_id}] 🤖 First response: {response.content}")
 
         if response.tool_calls:
@@ -248,44 +235,40 @@ async def chat(req: ChatRequest):
                         input=tool_args,
                         metadata={"tool_call_id": tool_id},
                     )
-                    tool_result = search_docs.invoke(tool_args)
-                    tool_span.end(output=tool_result)
+                    try:
+                        tool_result = search_docs.invoke(tool_args)
+                        tool_span.end(output=tool_result)
 
-                    memory = get_memory(session_id)
-                    memory.add_message(ToolMessage(tool_call_id=tool_id, content=tool_result))
+                        memory = get_memory(session_id)
+                        memory.add_message(ToolMessage(tool_call_id=tool_id, content=tool_result))
 
-            # ✅ Second LLM call (with tool results)
-            final_response = await chat_chain.ainvoke(
-                {"input": user_input},
-                config={
-                    "configurable": {
-                        "session_id": session_id,
-                        "langfuse": {
-                            "user_id": session_id,
-                            "traceId": trace.id,  # ✅ CORRECT KEY
-                        }
-                    }
-                },
-            )
+                    except Exception as tool_err:
+                        tool_span.end(output=str(tool_err), level="ERROR")
+                        logger.exception(f"[{session_id}] ❌ Tool error: {str(tool_err)}")
+                        user_input_gen.end(output="Tool failed")
+                        trace.score(name="conversation_success", value=0)
+                        return {"response": "Something went wrong during document search."}
 
+            # Second model call after tool
+            final_response = await invoke_chat_chain(user_input=user_input, session_id=session_id, trace=trace)
             logger.info(f"[{session_id}] 🤖 Final response: {final_response.content}")
+
             user_input_gen.end(output=final_response.content)
             trace.score(name="conversation_success", value=1)
 
             return {"response": final_response.content}
 
-        # No tool usage path
-        user_input_gen.end(output=response.content)
-        trace.score(name="conversation_success", value=1)
-        return {"response": response.content}
+        else:
+            # No tools were used
+            user_input_gen.end(output=response.content)
+            trace.score(name="conversation_success", value=1)
+            return {"response": response.content}
 
     except Exception as e:
         logger.exception(f"[{session_id}] ❌ Error: {str(e)}")
         user_input_gen.end(output="Error")
         trace.score(name="conversation_success", value=0)
         return {"response": "Something went wrong."}
-
-
 
 
 @app.get("/", response_class=HTMLResponse)
