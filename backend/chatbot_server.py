@@ -54,7 +54,7 @@ from langfuse import Langfuse
 langfuse = Langfuse(
   secret_key="sk-lf-edcc7119-bc4a-4c76-9f8c-515bf7e8c238",
   public_key="pk-lf-567548a7-51ee-4bfd-a488-cfdfdb00ce8f",
-  host="http://localhost:3000",
+  host="http://host.docker.internal:3000",
   debug=True,
 )
 
@@ -124,6 +124,7 @@ print("🔍 Manual Weaviate test result:", results)
 
 # === Tool definition ===
 @tool
+@observe(name="search_docs_tool")
 def search_docs(query: str) -> str:
     """Search documentation for relevant content."""
     print(f"🔍 search_docs called with query: {query}")
@@ -163,6 +164,7 @@ chat_chain = RunnableWithMessageHistory(
 )
 
 # === Observed Chat Chain Call ===
+@observe(name="chat_chain_invoke")
 async def invoke_chat_chain(user_input: str, session_id: str, trace=None):
     try:
         response = await chat_chain.ainvoke(
@@ -170,14 +172,14 @@ async def invoke_chat_chain(user_input: str, session_id: str, trace=None):
             config={"configurable": {"session_id": session_id}},
         )
 
-        # Optional manual logging inside this observation
-        if trace:
-            trace.generation(
-                name="model_response",
-                input=user_input,
-                output=response.content
-            )
-            trace.score(name="chain_success", value=1)
+        # # Optional manual logging inside this observation
+        # if trace:
+        #     trace.generation(
+        #         name="model_response",
+        #         input=user_input,
+        #         output=response.content
+        #     )
+        #     trace.score(name="chain_success", value=1)
 
         return response
 
@@ -204,21 +206,22 @@ async def chat(req: ChatRequest):
     logger.info(f"[{session_id}] 📨 User input: {user_input}")
 
     # 🔥 Start Langfuse trace
-    trace = langfuse.trace(
-        name="chat_session",
-        user_id=session_id,
-        metadata={"user_message": user_input},
-    )
-    user_input_gen = trace.generation(
-        name="user_message",
-        input=user_input,
-        output="(processing)",
-    )
+    # trace = langfuse.trace(
+    #     name="chat_session",
+    #     user_id=session_id,
+    #     metadata={"user_message": user_input},
+    # )
+    # user_input_gen = trace.generation(
+    #     name="user_message",
+    #     input=user_input,
+    #     output="(processing)",
+    # )
 
     try:
         # First model call
-        response = await invoke_chat_chain(user_input=user_input, session_id=session_id, trace=trace)
+        response = await invoke_chat_chain(user_input=user_input, session_id=session_id)
         logger.info(f"[{session_id}] 🤖 First response: {response.content}")
+        # user_input_gen.end(output=response.content)
 
         if response.tool_calls:
             logger.info(f"[{session_id}] 🛠 Tool calls: {response.tool_calls}")
@@ -229,45 +232,50 @@ async def chat(req: ChatRequest):
                 tool_id = tool_call["id"]
 
                 if tool_name == "search_docs":
-                    tool_span = trace.span(
-                        name="search_docs_tool",
-                        input=tool_args,
-                        metadata={"tool_call_id": tool_id},
-                    )
+                    # tool_span = trace.span(
+                    #     name="search_docs_tool",
+                    #     input=tool_args,
+                    #     metadata={"tool_call_id": tool_id},
+                    # )
                     try:
                         tool_result = search_docs.invoke(tool_args)
-                        tool_span.end(output=tool_result)
+                        # tool_span.end(output=tool_result)
 
 
                         memory.add_message(ToolMessage(tool_call_id=tool_id, content=tool_result))
 
                     except Exception as tool_err:
-                        tool_span.end(output=str(tool_err), level="ERROR")
+                        # tool_span.end(output=str(tool_err), level="ERROR")
                         logger.exception(f"[{session_id}] ❌ Tool error: {str(tool_err)}")
-                        user_input_gen.end(output="Tool failed")
-                        trace.score(name="conversation_success", value=0)
+                        # user_input_gen.end(output="Tool failed")
+                        # trace.score(name="conversation_success", value=0)
                         return {"response": "Something went wrong during document search."}
 
             # Second model call after tool
             # final_response = await invoke_chat_chain(user_input=user_input, session_id=session_id, trace=trace)
-            final_response = await invoke_chat_chain(user_input="", session_id=session_id, trace=trace)
+            final_response = await invoke_chat_chain(user_input="", session_id=session_id)
             logger.info(f"[{session_id}] 🤖 Final response: {final_response.content}")
 
-            user_input_gen.end(output=final_response.content)
-            trace.score(name="conversation_success", value=1)
+            # user_input_gen.end(output=final_response.content)
+            # trace.generation(
+            #     name="final_model_response",
+            #     input="(after tool)",
+            #     output=final_response.content
+            # )
+            # trace.score(name="conversation_success", value=1)
 
             return {"response": final_response.content}
 
         else:
             # No tools were used
-            user_input_gen.end(output=response.content)
-            trace.score(name="conversation_success", value=1)
+            # user_input_gen.end(output=response.content)
+            # trace.score(name="conversation_success", value=1)
             return {"response": response.content}
 
     except Exception as e:
         logger.exception(f"[{session_id}] ❌ Error: {str(e)}")
-        user_input_gen.end(output="Error")
-        trace.score(name="conversation_success", value=0)
+        # user_input_gen.end(output="Error")
+        # trace.score(name="conversation_success", value=0)
         return {"response": "Something went wrong."}
 
 
