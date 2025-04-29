@@ -124,6 +124,7 @@ print("🔍 Manual Weaviate test result:", results)
 
 # === Tool definition ===
 @tool
+@observe(name="search_docs_tool")  # This will appear as a separate trace span in Langfuse
 def search_docs(query: str) -> str:
     """Search documentation for relevant content."""
     print(f"🔍 search_docs called with query: {query}")
