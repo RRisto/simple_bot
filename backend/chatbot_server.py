@@ -224,7 +224,7 @@ async def chat(req: ChatRequest):
 
         if response.tool_calls:
             logger.info(f"[{session_id}] 🛠 Tool calls: {response.tool_calls}")
-
+            memory = get_memory(session_id)
             for tool_call in response.tool_calls:
                 tool_name = tool_call["name"]
                 tool_args = tool_call["args"]
@@ -240,7 +240,7 @@ async def chat(req: ChatRequest):
                         tool_result = search_docs.invoke(tool_args)
                         tool_span.end(output=tool_result)
 
-                        memory = get_memory(session_id)
+
                         memory.add_message(ToolMessage(tool_call_id=tool_id, content=tool_result))
 
                     except Exception as tool_err:
@@ -251,7 +251,8 @@ async def chat(req: ChatRequest):
                         return {"response": "Something went wrong during document search."}
 
             # Second model call after tool
-            final_response = await invoke_chat_chain(user_input=user_input, session_id=session_id, trace=trace)
+            # final_response = await invoke_chat_chain(user_input=user_input, session_id=session_id, trace=trace)
+            final_response = await invoke_chat_chain(user_input="", session_id=session_id, trace=trace)
             logger.info(f"[{session_id}] 🤖 Final response: {final_response.content}")
 
             user_input_gen.end(output=final_response.content)
