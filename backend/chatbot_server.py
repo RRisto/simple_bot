@@ -124,7 +124,6 @@ print("🔍 Manual Weaviate test result:", results)
 
 # === Tool definition ===
 @tool
-@observe(name="search_docs_tool")  # This will appear as a separate trace span in Langfuse
 def search_docs(query: str) -> str:
     """Search documentation for relevant content."""
     print(f"🔍 search_docs called with query: {query}")
@@ -164,7 +163,6 @@ chat_chain = RunnableWithMessageHistory(
 )
 
 # === Observed Chat Chain Call ===
-@observe(name="chat_chain_invoke")
 async def invoke_chat_chain(user_input: str, session_id: str, trace=None):
     try:
         response = await chat_chain.ainvoke(
