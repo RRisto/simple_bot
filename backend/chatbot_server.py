@@ -29,6 +29,9 @@ WEAVIATE_HOST = os.getenv("WEAVIATE_HOST")
 WEAVIATE_PORT = os.getenv("WEAVIATE_PORT")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+DO_RERANKING = os.getenv("DO_RERANKING", "false").lower() == "true"
+COLLECT_NEIGHBORS = os.getenv("COLLECT_NEIGHBORS", "false").lower() == "true"  # collect +1/-1 neighbors for query chunks
+
 # === Setup logging  ===
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
@@ -105,10 +108,14 @@ vectorstore = WeaviateVectorStore(
 
 retriever = vectorstore.as_retriever()
 
+# Setup reranker
+if DO_RERANKING:
+    from langchain_community.document_compressors.rankllm_rerank import RankLLMRerank
+    reranker = RankLLMRerank(top_n=3, model="gpt", gpt_model="gpt-4o-mini")
+
 
 # === Tool definition ===
 # Use Weaviate native client to fetch neighbors
-
 
 def fetch_neighbor_chunk(filename, chunk_idx):
     try:
@@ -141,7 +148,8 @@ def fetch_neighbor_chunk(filename, chunk_idx):
 
 
 @tool
-def search_docs(query: str, n=3):
+@observe(name="search_docs")
+def search_docs(query: str, n: int = 3, trace_id: str = None):
     """Search documentation and return each match with 1 chunk before and after."""
     print(f"🔍 search_docs called with query: {query}")
     docs = retriever.invoke(query)
@@ -161,22 +169,28 @@ def search_docs(query: str, n=3):
             seen.add(doc.page_content)
 
         # Try to add surrounding chunks
-        for offset in [-1, 1]:
-            neighbor_idx = idx + offset
-            neighbors = fetch_neighbor_chunk(filename, neighbor_idx)
-            print("🔍   Number of neighbors found:", len(neighbors))
-            for neighbor in neighbors:
-                if neighbor.page_content not in seen:
-                    context_chunks.append(neighbor)
-                    seen.add(neighbor.page_content)
+        if COLLECT_NEIGHBORS:
+            for offset in [-1, 1]:
+                neighbor_idx = idx + offset
+                neighbors = fetch_neighbor_chunk(filename, neighbor_idx)
+                print("🔍   Number of neighbors found:", len(neighbors))
+                for neighbor in neighbors:
+                    if neighbor.page_content not in seen:
+                        context_chunks.append(neighbor)
+                        seen.add(neighbor.page_content)
 
-    # Format and return
-    result = "\n\n".join(doc.page_content for doc in context_chunks[:n])
+    # Format, rerank and return
+    if DO_RERANKING:
+        reranked_docs = reranker.compress_documents(documents=context_chunks, query=query)
+    else:
+        reranked_docs = context_chunks
+    result = "\n\n".join(doc.page_content for doc in reranked_docs[:n])
     print(f"📚 search_docs result:\n{result}")
     print(f"all docs found {len(context_chunks)}, n docs returned {len(context_chunks[:n])}.\n")
     logger.info(
         f"all docs found {len(docs)}, n unique {len(context_chunks)} n docs returned {len(context_chunks[:n])}.\n")
-    logger.info(print(f"📚 search_docs result:\n{result}"))
+    logger.info(f"📚 search_docs results wo reranking:\n{context_chunks}")
+    logger.info(f"📚 search_docs results reranked:\n{result}")
     return result
 
 
@@ -216,10 +230,11 @@ async def invoke_chat_chain(user_input: str, session_id: str, trace_id: str):
             "configurable": {
                 "session_id": session_id,
                 "langfuse": {"trace_id": trace_id}
-            }
+            },
         },
     )
     return response
+
 
 
 # === FastAPI schema ===
@@ -229,6 +244,9 @@ class ChatRequest(BaseModel):
 
 
 # === Chat Endpoint ===
+from langfuse.decorators import langfuse_context
+
+@observe()
 @app.post("/chat")
 async def chat(req: ChatRequest):
     session_id = req.user_id
@@ -236,14 +254,14 @@ async def chat(req: ChatRequest):
 
     logger.info(f"[{session_id}] 📨 User input: {user_input}")
 
-    # 🔥 Start Langfuse trace
-
     # manually start trace
     trace = langfuse.trace(
+        id=session_id,
         name="chat_session",
         user_id=session_id,
         metadata={"user_message": user_input},
     )
+    langfuse_context.update_current_trace(trace)
 
     try:
         # First model call
@@ -252,6 +270,7 @@ async def chat(req: ChatRequest):
             session_id=session_id,
             trace_id=trace.id,  # <<< important!
         )
+        handler = langfuse_context.get_current_langchain_handler()
         logger.info(f"[{session_id}] 🤖 First response: {response.content}")
 
         if response.tool_calls:
@@ -264,6 +283,7 @@ async def chat(req: ChatRequest):
 
                 if tool_name == "search_docs":
                     try:
+                        tool_args["trace_id"] = trace.id
                         tool_result = search_docs.invoke(tool_args)
                         logger.info(f"[{session_id}] 📚 Tool result: {tool_result}")
                         trace.span(
