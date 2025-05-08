@@ -11,6 +11,7 @@ services:
     volumes:
       - ./weaviate_storage:/var/lib/weaviate  # ✅ host folder mapping
 
+
   backend:
     build: ./backend
     ports:
@@ -32,3 +33,5 @@ services:
       - ./rag_docs:/app/rag_docs
     depends_on:
       - weaviate
+    entrypoint: [ "python", "load_to_weaviate.py" ]  # your main script
+    restart: "no"  # Only run once and exit after ingesting

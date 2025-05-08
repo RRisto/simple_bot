@@ -14,12 +14,12 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_weaviate.vectorstores import WeaviateVectorStore
+from langchain.docstore.document import Document
 from langfuse import Langfuse
 from langfuse.decorators import observe
 from weaviate.client import WeaviateClient
 from weaviate.connect import ConnectionParams
-
-from langchain_core.documents import Document
+from weaviate.classes.query import Filter
 
 # === Load environment ===
 load_dotenv()
@@ -49,15 +49,6 @@ langfuse = Langfuse(
     debug=True,
 )
 
-from langfuse import Langfuse
-#TODO
-langfuse = Langfuse(
-  secret_key="sk-lf-edcc7119-bc4a-4c76-9f8c-515bf7e8c238",
-  public_key="pk-lf-567548a7-51ee-4bfd-a488-cfdfdb00ce8f",
-  host="http://host.docker.internal:3000",
-  debug=True,
-)
-
 try:
     response = requests.get(f"{os.getenv('LANGFUSE_HOST')}/api/public/health")
     if response.status_code == 200:
@@ -66,6 +57,7 @@ try:
         print(f"⚠️ Langfuse health endpoint returned status: {response.status_code}")
 except Exception as e:
     print(f"❌ Failed to reach Langfuse server: {e}")
+
 
 # === Wait for Weaviate ===
 def wait_for_weaviate(url, timeout=30):
@@ -79,6 +71,7 @@ def wait_for_weaviate(url, timeout=30):
             pass
         time.sleep(1)
     raise Exception("Weaviate did not start in time")
+
 
 wait_for_weaviate(f"http://{WEAVIATE_HOST}:{WEAVIATE_PORT}")
 
@@ -112,32 +105,80 @@ vectorstore = WeaviateVectorStore(
 
 retriever = vectorstore.as_retriever()
 
-print("Testing Weaviate query:")
-print(retriever.invoke("advokatuur"))
-
-# Test inserting a document
-test_doc = Document(page_content="Advokatuur on Eesti õigussüsteemi osa.")
-vectorstore.add_documents([test_doc])
-
-results = retriever.invoke("advokatuur")
-print("🔍 Manual Weaviate test result:", results)
 
 # === Tool definition ===
+# Use Weaviate native client to fetch neighbors
+
+
+def fetch_neighbor_chunk(filename, chunk_idx):
+    try:
+        filters = (
+                Filter.by_property("filename").equal(filename) &
+                Filter.by_property("chunk_index").equal(int(chunk_idx))
+        )
+
+        result = client.collections.get("LangchainDocs").query.fetch_objects(
+            filters=filters,
+            limit=1,
+            return_properties=["text", "filename", "chunk_index"]
+        )
+        print(f"🔍   Found {len(result.objects)} objects for chunk {chunk_idx} of {filename}")
+
+        return [
+            Document(
+                page_content=obj.properties["text"],
+                metadata={
+                    "filename": obj.properties.get("filename"),
+                    "chunk_index": obj.properties.get("chunk_index")
+                }
+            )
+            for obj in result.objects
+        ]
+
+    except Exception as e:
+        print(f"⚠️ Error fetching chunk {chunk_idx} for {filename}: {e}")
+        return []
+
+
 @tool
-def search_docs(query: str):
-    """Search documentation for relevant content."""
+def search_docs(query: str, n=3):
+    """Search documentation and return each match with 1 chunk before and after."""
     print(f"🔍 search_docs called with query: {query}")
     docs = retriever.invoke(query)
+
+    context_chunks = []
     seen = set()
-    unique_docs = []
+
     for doc in docs:
-        content = doc.page_content.strip()
-        if content not in seen:
-            seen.add(content)
-            unique_docs.append(content)
-    result = "\n\n".join(unique_docs[:3])
+
+        print(f'🔍   Found match: {doc.metadata.get("chunk_index")}  {doc.page_content}')
+        filename = doc.metadata.get("filename")
+        idx = doc.metadata.get("chunk_index")
+
+        # Add current match
+        if doc.page_content not in seen:
+            context_chunks.append(doc)
+            seen.add(doc.page_content)
+
+        # Try to add surrounding chunks
+        for offset in [-1, 1]:
+            neighbor_idx = idx + offset
+            neighbors = fetch_neighbor_chunk(filename, neighbor_idx)
+            print("🔍   Number of neighbors found:", len(neighbors))
+            for neighbor in neighbors:
+                if neighbor.page_content not in seen:
+                    context_chunks.append(neighbor)
+                    seen.add(neighbor.page_content)
+
+    # Format and return
+    result = "\n\n".join(doc.page_content for doc in context_chunks[:n])
     print(f"📚 search_docs result:\n{result}")
+    print(f"all docs found {len(context_chunks)}, n docs returned {len(context_chunks[:n])}.\n")
+    logger.info(
+        f"all docs found {len(docs)}, n unique {len(context_chunks)} n docs returned {len(context_chunks[:n])}.\n")
+    logger.info(print(f"📚 search_docs result:\n{result}"))
     return result
+
 
 # === Prompt with memory ===
 prompt = ChatPromptTemplate.from_messages([
@@ -152,8 +193,10 @@ llm = ChatOpenAI(model="gpt-4", temperature=0).bind_tools([search_docs])
 
 store = {}
 
+
 def get_memory(session_id):
     return store.setdefault(session_id, ChatMessageHistory())
+
 
 chat_chain = RunnableWithMessageHistory(
     prompt | llm,
@@ -161,6 +204,7 @@ chat_chain = RunnableWithMessageHistory(
     input_messages_key="input",
     history_messages_key="history"
 )
+
 
 # === Observed Chat Chain Call ===
 @observe(name="chat_chain_invoke")
@@ -176,10 +220,13 @@ async def invoke_chat_chain(user_input: str, session_id: str, trace_id: str):
         },
     )
     return response
+
+
 # === FastAPI schema ===
 class ChatRequest(BaseModel):
     user_id: str
     message: str
+
 
 # === Chat Endpoint ===
 @app.post("/chat")
@@ -197,11 +244,6 @@ async def chat(req: ChatRequest):
         user_id=session_id,
         metadata={"user_message": user_input},
     )
-    # user_input_gen = trace.generation(
-    #     name="user_message",
-    #     input=user_input,
-    #     output="(processing)",
-    # )
 
     try:
         # First model call
@@ -211,7 +253,6 @@ async def chat(req: ChatRequest):
             trace_id=trace.id,  # <<< important!
         )
         logger.info(f"[{session_id}] 🤖 First response: {response.content}")
-        # user_input_gen.end(output=response.content)
 
         if response.tool_calls:
             logger.info(f"[{session_id}] 🛠 Tool calls: {response.tool_calls}")
@@ -222,50 +263,33 @@ async def chat(req: ChatRequest):
                 tool_id = tool_call["id"]
 
                 if tool_name == "search_docs":
-                    # tool_span = trace.span(
-                    #     name="search_docs_tool",
-                    #     input=tool_args,
-                    #     metadata={"tool_call_id": tool_id},
-                    # )
                     try:
                         tool_result = search_docs.invoke(tool_args)
-                        # tool_span.end(output=tool_result)
-
-
+                        logger.info(f"[{session_id}] 📚 Tool result: {tool_result}")
+                        trace.span(
+                            name="search_docs",
+                            input=tool_args,
+                            output=tool_result,
+                            metadata={"tool_call_id": tool_id}
+                        )
                         memory.add_message(ToolMessage(tool_call_id=tool_id, content=tool_result))
 
                     except Exception as tool_err:
-                        # tool_span.end(output=str(tool_err), level="ERROR")
                         logger.exception(f"[{session_id}] ❌ Tool error: {str(tool_err)}")
-                        # user_input_gen.end(output="Tool failed")
-                        # trace.score(name="conversation_success", value=0)
                         return {"response": "Something went wrong during document search."}
 
             # Second model call after tool
-            # final_response = await invoke_chat_chain(user_input=user_input, session_id=session_id, trace=trace)
             final_response = await invoke_chat_chain(user_input="", session_id=session_id, trace_id=trace.id)
             logger.info(f"[{session_id}] 🤖 Final response: {final_response.content}")
-
-            # user_input_gen.end(output=final_response.content)
-            # trace.generation(
-            #     name="final_model_response",
-            #     input="(after tool)",
-            #     output=final_response.content
-            # )
-            # trace.score(name="conversation_success", value=1)
 
             return {"response": final_response.content}
 
         else:
             # No tools were used
-            # user_input_gen.end(output=response.content)
-            # trace.score(name="conversation_success", value=1)
             return {"response": response.content}
 
     except Exception as e:
         logger.exception(f"[{session_id}] ❌ Error: {str(e)}")
-        # user_input_gen.end(output="Error")
-        # trace.score(name="conversation_success", value=0)
         return {"response": "Something went wrong."}
 
 
@@ -273,6 +297,7 @@ async def chat(req: ChatRequest):
 async def home():
     with open("templates/index.html", "r", encoding="utf-8") as f:
         return f.read()
+
 
 @app.on_event("shutdown")
 def shutdown_event():
